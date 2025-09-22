@@ -1,9 +1,12 @@
 // ==========================================================================
-// == FIRMWARE LETE - MONITOR DE ENERGÍA v4.2
+// == FIRMWARE LETE - MONITOR DE ENERGÍA v4.3
 // ==
 // == MEJORAS:
-// == - Implementada la actualización remota de firmware (OTA por HTTP).
+// == - Calibración persistente guardada en SPIFFS.
+// == - Página web de calibración.
+// == - Contraseña de seguridad para la interfaz web de diagnóstico.
 // =========================================================================
+
 
 // --- 1. LIBRERÍAS ---
 #include <WiFi.h>
@@ -17,18 +20,27 @@
 #include <Adafruit_SSD1306.h>
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
+#include "FS.h"
+#include "SPIFFS.h"
+#include <ArduinoJson.h>
 #include "EmonLib.h"
 #include "time.h"
 
 // --- 2. CONFIGURACIÓN PRINCIPAL ---
-const float FIRMWARE_VERSION = 4.2;
+const float FIRMWARE_VERSION = 4.3;
 #define SERVICE_TYPE "1F"
 const bool OLED_CONECTADA = false; // Ajusta según si tienes la pantalla conectada
 
+// --- Contraseña para la Interfaz Web de Diagnóstico ---
+const char* http_username = "admin";
+const char* http_password = "123456788"; // <-- CAMBIA ESTA CONTRASEÑA
+
 // --- URLs para Actualización Remota (OTA por HTTP) ---
 const char* firmware_version_url = "https://raw.githubusercontent.com/galjoctavio-ux/lete_scripts_backend/main/firmware.version";
+
 // Usamos %s como un comodín para el número de versión
 const char* firmware_bin_url_template = "https://github.com/galjoctavio-ux/lete_scripts_backend/releases/download/%s/firmware.bin";
+
 // --- Configuración de InfluxDB ---
 #define INFLUXDB_URL "https://us-east-1-1.aws.cloud2.influxdata.com/api/v2/write?org=LETE&bucket=mediciones_energia&precision=s"
 #define INFLUXDB_TOKEN "Ngu_66P3bgxtwqXhhBWpazpexNFfKFL9FfWkokdSG2T8DupYvuq8GnbQ0RU1XrKevbZYYuIDe4sQMoPeqnDTlA=="
@@ -48,9 +60,9 @@ const int CURRENT_SENSOR_PIN_1 = 35; // Fase
 const int CURRENT_SENSOR_PIN_2 = 32; // Neutro
 
 // --- Calibración de Sensores ---
-const float VOLTAGE_CAL = 265.0;
-const float CURRENT_CAL_1 = 11.07;
-const float CURRENT_CAL_2 = 11.71;
+float voltage_cal = 265.0;
+float current_cal_1 = 11.07;
+float current_cal_2 = 11.71;
 
 // --- 4. OBJETOS Y VARIABLES GLOBALES ---
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
@@ -70,6 +82,45 @@ unsigned long last_measurement_time = 0;
 unsigned long last_update_check = 0;
 
 // --- 5. FUNCIONES ---
+
+void saveCalibration() {
+    SPIFFS.remove("/calibracion.json");
+    File file = SPIFFS.open("/calibracion.json", FILE_WRITE);
+    if (!file) {
+        Serial.println("Error al abrir archivo de calibracion para escritura");
+        return;
+    }
+    StaticJsonDocument<256> doc;
+    doc["voltage_cal"] = voltage_cal;
+    doc["current_cal_1"] = current_cal_1;
+    doc["current_cal_2"] = current_cal_2;
+    if (serializeJson(doc, file) == 0) {
+        Serial.println("Error al escribir en archivo de calibracion");
+    } else {
+        Serial.println("Calibracion guardada en SPIFFS.");
+    }
+    file.close();
+}
+
+void loadCalibration() {
+    File file = SPIFFS.open("/calibracion.json", FILE_READ);
+    if (!file || file.size() == 0) {
+        Serial.println("No se encontro archivo de calibracion, usando valores por defecto.");
+        saveCalibration(); // Guarda los valores por defecto la primera vez
+        return;
+    }
+    StaticJsonDocument<256> doc;
+    DeserializationError error = deserializeJson(doc, file);
+    if (error) {
+        Serial.println("Error al leer archivo de calibracion, usando valores por defecto.");
+        return;
+    }
+    voltage_cal = doc["voltage_cal"] | voltage_cal;
+    current_cal_1 = doc["current_cal_1"] | current_cal_1;
+    current_cal_2 = doc["current_cal_2"] | current_cal_2;
+    Serial.println("Calibracion cargada desde SPIFFS.");
+    file.close();
+}
 
 void setupOLED() {
   if (OLED_CONECTADA) {
@@ -245,6 +296,9 @@ void checkForHttpUpdate() {
 }
 
 void handleRoot() {
+  if (!server.authenticate(http_username, http_password)) {
+    return server.requestAuthentication();
+  }
   char uptime_str[20];
   long uptime_seconds = millis() / 1000;
   sprintf(uptime_str, "%dd %dh %dm", uptime_seconds / 86400, (uptime_seconds % 86400) / 3600, (uptime_seconds % 3600) / 60);
@@ -271,17 +325,46 @@ void handleRoot() {
 }
 
 void handleUpdate() {
+  if (!server.authenticate(http_username, http_password)) {
+    return server.requestAuthentication();
+  }
     server.send(200, "text/plain", "OK. Buscando actualizaciones... Revisa el Monitor Serie.");
     delay(100);
     checkForHttpUpdate();
 }
 
 void handleResetWifi() {
+  if (!server.authenticate(http_username, http_password)) {
+    return server.requestAuthentication();
+  }
   server.send(200, "text/plain", "OK. Credenciales Wi-Fi borradas. El dispositivo se reiniciara en Modo Configuracion.");
   delay(1000);
   WiFiManager wm;
   wm.resetSettings();
   ESP.restart();
+}
+
+void handleCalibration() {
+    if (!server.authenticate(http_username, http_password)) {
+        return server.requestAuthentication();
+    }
+    if (server.hasArg("voltage") && server.hasArg("current1") && server.hasArg("current2")) {
+        voltage_cal = server.arg("voltage").toFloat();
+        current_cal_1 = server.arg("current1").toFloat();
+        current_cal_2 = server.arg("current2").toFloat();
+        saveCalibration();
+        server.send(200, "text/plain", "OK. Calibracion guardada. Reinicia el dispositivo para aplicar.");
+    } else {
+        String html = "<html><head><title>Calibracion LETE</title></head><body>";
+        html += "<h1>Calibracion del Dispositivo</h1>";
+        html += "<form action='/calibracion' method='POST'>";
+        html += "Voltaje (V_CAL): <input type='text' name='voltage' value='" + String(voltage_cal) + "'><br>";
+        html += "Corriente 1 (I_CAL1): <input type='text' name='current1' value='" + String(current_cal_1) + "'><br>";
+        html += "Corriente 2 (I_CAL2): <input type='text' name='current2' value='" + String(current_cal_2) + "'><br>";
+        html += "<input type='submit' value='Guardar'>";
+        html += "</form></body></html>";
+        server.send(200, "text/html", html);
+    }
 }
 
 // --- 6. FUNCIÓN DE SETUP ---
@@ -290,6 +373,10 @@ void setup() {
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   setupOLED();
+
+  // INICIA EL SISTEMA DE ARCHIVOS Y CARGA LA CALIBRACIÓN
+  SPIFFS.begin(true);
+  loadCalibration();
 
   Serial.println("Mantenga presionado el boton BOOT por 5s para borrar WiFi...");
   if (OLED_CONECTADA) {
@@ -320,9 +407,9 @@ void setup() {
 
   drawBootScreen();
 
-  emon1.voltage(VOLTAGE_SENSOR_PIN, VOLTAGE_CAL, 1.7);
-  emon1.current(CURRENT_SENSOR_PIN_1, CURRENT_CAL_1);
-  emon2.current(CURRENT_SENSOR_PIN_2, CURRENT_CAL_2);
+  emon1.voltage(VOLTAGE_SENSOR_PIN, voltage_cal, 1.7);
+  emon1.current(CURRENT_SENSOR_PIN_1, current_cal_1);
+  emon2.current(CURRENT_SENSOR_PIN_2, current_cal_2);
 
   WiFiManager wm;
   String apName = "LETE-Monitor-Config";
@@ -346,6 +433,8 @@ void setup() {
   server.on("/", handleRoot);
   server.on("/update", handleUpdate);
   server.on("/reset-wifi", handleResetWifi);
+  server.on("/calibracion", HTTP_GET, handleCalibration);  // Página para mostrar el formulario
+  server.on("/calibracion", HTTP_POST, handleCalibration); // Ruta para recibir los datos
   server.begin();
 }
 
