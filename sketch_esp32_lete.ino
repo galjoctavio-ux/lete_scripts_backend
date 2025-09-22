@@ -1,11 +1,9 @@
 // ==========================================================================
-// == FIRMWARE LETE - MONITOR DE ENERGÍA v4.1 (Optimizado)
+// == FIRMWARE LETE - MONITOR DE ENERGÍA v4.2
 // ==
 // == MEJORAS:
-// == - Gestión de memoria de HTTPClient optimizada para evitar errores de conexión.
-// == - Aumentado el tiempo de espera (timeout) para conexiones seguras.
-// == - Telemetría de memoria RAM en Monitor Serie.
-// ==========================================================================
+// == - Implementada la actualización remota de firmware (OTA por HTTP).
+// =========================================================================
 
 // --- 1. LIBRERÍAS ---
 #include <WiFi.h>
@@ -23,14 +21,14 @@
 #include "time.h"
 
 // --- 2. CONFIGURACIÓN PRINCIPAL ---
-const float FIRMWARE_VERSION = 4.1;
+const float FIRMWARE_VERSION = 4.2;
 #define SERVICE_TYPE "1F"
 const bool OLED_CONECTADA = false; // Ajusta según si tienes la pantalla conectada
 
 // --- URLs para Actualización Remota (OTA por HTTP) ---
-const char* firmware_version_url = "https://raw.githubusercontent.com/tu-usuario/tu-repo/main/firmware.version";
-const char* firmware_bin_url = "https://raw.githubusercontent.com/tu-usuario/tu-repo/main/firmware.bin";
-
+const char* firmware_version_url = "https://raw.githubusercontent.com/galjoctavio-ux/lete_scripts_backend/main/firmware.version";
+// Usamos %s como un comodín para el número de versión
+const char* firmware_bin_url_template = "https://github.com/galjoctavio-ux/lete_scripts_backend/releases/download/%s/firmware.bin";
 // --- Configuración de InfluxDB ---
 #define INFLUXDB_URL "https://us-east-1-1.aws.cloud2.influxdata.com/api/v2/write?org=LETE&bucket=mediciones_energia&precision=s"
 #define INFLUXDB_TOKEN "Ngu_66P3bgxtwqXhhBWpazpexNFfKFL9FfWkokdSG2T8DupYvuq8GnbQ0RU1XrKevbZYYuIDe4sQMoPeqnDTlA=="
@@ -69,6 +67,7 @@ bool server_status = false;
 int screen_mode = 0;
 long last_button_press = 0;
 unsigned long last_measurement_time = 0;
+unsigned long last_update_check = 0;
 
 // --- 5. FUNCIONES ---
 
@@ -124,6 +123,22 @@ void drawConfigScreen(const char* apName) {
     Serial.print("Conectate a la red Wi-Fi: ");
     Serial.println(apName);
     Serial.println("Abre 192.168.4.1 en tu navegador.");
+  }
+}
+
+void drawUpdateScreen(String text) {
+  if (OLED_CONECTADA) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("--- ACTUALIZANDO ---");
+    display.setTextSize(2);
+    display.setCursor(10, 25);
+    display.println(text);
+    display.display();
+  } else {
+    Serial.println("--- ACTUALIZANDO ---");
+    Serial.println(text);
   }
 }
 
@@ -183,7 +198,50 @@ void drawDiagnosticsScreen() {
 }
 
 void checkForHttpUpdate() {
-  // ... (Esta función se puede rellenar si se necesita OTA remoto)
+  Serial.println("Buscando actualizaciones remotas...");
+  if (OLED_CONECTADA) drawUpdateScreen("Buscando...");
+
+  HTTPClient http;
+  http.begin(firmware_version_url);
+  int httpCode = http.GET();
+  
+  if (httpCode == HTTP_CODE_OK) {
+    String version_str = http.getString();
+    float new_version = version_str.toFloat(); // CORRECCIÓN: variable correcta es new_version
+    Serial.printf("Version actual: %.2f, Version en servidor: %s\n", FIRMWARE_VERSION, version_str.c_str());
+
+    if (new_version > FIRMWARE_VERSION) {
+      Serial.println("Nueva version disponible. Actualizando...");
+      
+      char final_firmware_url[256];
+      sprintf(final_firmware_url, firmware_bin_url_template, ("v" + version_str).c_str());
+
+      Serial.print("URL de descarga final: ");
+      Serial.println(final_firmware_url);
+
+      if (OLED_CONECTADA) drawUpdateScreen("Descargando");
+      
+      HTTPClient httpUpdateClient;
+      httpUpdateClient.begin(final_firmware_url); // CORRECCIÓN: Usar la URL final
+      t_httpUpdate_return ret = httpUpdate.update(httpUpdateClient);
+
+      switch (ret) {
+        case HTTP_UPDATE_FAILED:
+          Serial.printf("Actualizacion Fallida. Error (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
+          if (OLED_CONECTADA) drawUpdateScreen("Error!");
+          delay(2000);
+          break;
+        case HTTP_UPDATE_OK:
+          Serial.println("¡Actualizacion exitosa! Reiniciando...");
+          break;
+      }
+    } else {
+      Serial.println("El firmware ya esta actualizado.");
+    }
+  } else {
+    Serial.printf("Error al verificar version. Codigo HTTP: %d\n", httpCode);
+  }
+  http.end();
 }
 
 void handleRoot() {
@@ -205,6 +263,9 @@ void handleRoot() {
   html += "<h2>Diagnostico del Sistema</h2>";
   html += "<p><b>Uptime:</b> " + String(uptime_str) + "</p>";
   html += "<p><b>Memoria Libre:</b> " + String(ESP.getFreeHeap() / 1024) + " KB</p>";
+  html += "<h2>Acciones</h2>";
+  html += "<p><a href='/update'>Buscar Actualizaciones de Firmware</a></p>";
+  html += "<p><a href='/reset-wifi'>Borrar Credenciales Wi-Fi</a></p>";
   html += "</body></html>";
   server.send(200, "text/html", html);
 }
@@ -298,6 +359,12 @@ void loop() {
       last_button_press = millis();
       screen_mode = (screen_mode + 1) % 3;
     }
+  }
+
+  // Verificación periódica de actualizaciones remotas
+  if (WiFi.status() == WL_CONNECTED && millis() - last_update_check > (4 * 3600 * 1000)) { // Cada 4 horas
+      last_update_check = millis();
+      checkForHttpUpdate();
   }
 
   // Bucle principal de medición y envío cada 2 segundos
